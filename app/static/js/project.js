@@ -6,6 +6,7 @@
   "use strict";
 
   var PROJECT_ID = null;
+  var SESSION_ID = null;
   var treeEl = document.getElementById("project-tree");
   var viewerEl = document.getElementById("file-viewer");
   var chatMessagesEl = document.getElementById("project-chat-messages");
@@ -14,6 +15,7 @@
   var reviewSummaryEl = document.getElementById("review-summary");
   var streaming = false;
   var chatLoaded = false;
+  var sessionsLoaded = false;
 
   function getCsrf() {
     var meta = document.querySelector('meta[name="csrf-token"]');
@@ -131,6 +133,80 @@
 
   function scrollChat() {
     chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+  }
+
+  // ----------------------------------------------------------------- sessions
+
+  function loadSessions() {
+    api("/workspaces/api/projects/" + PROJECT_ID + "/sessions")
+      .then(function (sessions) {
+        var sidebar = document.getElementById("session-sidebar");
+        if (!sidebar) return;
+        sidebar.innerHTML = "";
+        sessions.forEach(function (session) {
+          var item = document.createElement("div");
+          item.className = "session-item" + (session.id === SESSION_ID ? " active" : "");
+          item.innerHTML =
+            '<span class="session-title">' + escapeHtml(session.title) + "</span>" +
+            '<button class="btn btn-ghost btn-sm session-delete-btn" type="button" title="Delete session">x</button>';
+          item.querySelector(".session-title").addEventListener("click", function () {
+            switchSession(session.id);
+          });
+          item.querySelector(".session-delete-btn").addEventListener("click", function (e) {
+            e.stopPropagation();
+            deleteSession(session.id);
+          });
+          sidebar.appendChild(item);
+        });
+        var newBtn = document.createElement("button");
+        newBtn.className = "btn btn-ghost btn-sm";
+        newBtn.type = "button";
+        newBtn.textContent = "+ New Session";
+        newBtn.addEventListener("click", createSession);
+        sidebar.appendChild(newBtn);
+        sessionsLoaded = true;
+      })
+      .catch(function (error) {
+        flashError(error.message);
+      });
+  }
+
+  function switchSession(sessionId) {
+    SESSION_ID = sessionId;
+    chatLoaded = false;
+    loadChatHistory();
+    loadSessions();
+  }
+
+  function createSession() {
+    var title = prompt("Session title:");
+    if (!title) return;
+    api("/workspaces/api/projects/" + PROJECT_ID + "/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title }),
+    })
+      .then(function (session) {
+        switchSession(session.id);
+      })
+      .catch(function (error) {
+        flashError(error.message);
+      });
+  }
+
+  function deleteSession(sessionId) {
+    if (!confirm("Delete this session and all its messages?")) return;
+    api("/workspaces/api/projects/" + PROJECT_ID + "/sessions/" + sessionId, {
+      method: "DELETE",
+    })
+      .then(function () {
+        SESSION_ID = null;
+        loadSessions();
+        loadChatHistory();
+      })
+      .catch(function (error) {
+        flashError(error.message);
+      });
   }
 
   // ------------------------------------------------------------------ tabs
@@ -341,7 +417,9 @@
 
   function loadChatHistory() {
     chatLoaded = true;
-    api("/workspaces/api/projects/" + PROJECT_ID + "/messages")
+    var url = "/workspaces/api/projects/" + PROJECT_ID + "/messages";
+    if (SESSION_ID) url += "?session_id=" + SESSION_ID;
+    api(url)
       .then(function (messages) {
         chatMessagesEl.innerHTML = "";
         messages.forEach(function (message) {
@@ -373,6 +451,8 @@
     var typing = addTypingIndicator();
     var bodyEl = typing.querySelector(".typing-indicator");
 
+    var attachedFiles = window.attachedFiles || [];
+
     try {
       var response = await fetch("/workspaces/api/projects/" + PROJECT_ID + "/chat/stream", {
         method: "POST",
@@ -380,7 +460,7 @@
           "Content-Type": "application/json",
           "X-CSRFToken": getCsrf(),
         },
-        body: JSON.stringify({ content: content }),
+        body: JSON.stringify({ content: content, attached_files: attachedFiles, session_id: SESSION_ID }),
       });
 
       if (!response.ok) {

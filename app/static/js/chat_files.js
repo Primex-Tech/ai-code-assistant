@@ -198,20 +198,57 @@
     treeEl.hidden = false;
   }
 
-  treeEl.addEventListener("click", function (event) {
+var attachedFiles = window.attachedFiles || new Set();
+window.attachedFiles = attachedFiles;
+
+function renderAttachedIndicator(li) {
+    var existing = li.querySelector(".attached-indicator");
+    if (attachedFiles.has(li.dataset.path)) {
+        if (!existing) {
+            var indicator = document.createElement("span");
+            indicator.className = "attached-indicator";
+            indicator.textContent = " 📎";
+            indicator.style.color = "#4caf50";
+            indicator.style.fontWeight = "bold";
+            li.querySelector(".file-tree-name").appendChild(indicator);
+        }
+    } else if (existing) {
+        existing.remove();
+    }
+}
+
+treeEl.addEventListener("click", function (event) {
     var item = event.target.closest(".file-tree-file");
     if (!item) return;
+    if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (attachedFiles.has(item.dataset.path)) {
+            attachedFiles.delete(item.dataset.path);
+            item.style.opacity = "";
+        } else {
+            attachedFiles.add(item.dataset.path);
+            item.style.opacity = "0.7";
+        }
+        window.attachedFiles = attachedFiles;
+        renderAttachedIndicator(item);
+        return;
+    }
     showFile(item.dataset.project, item.dataset.path);
-  });
+});
 
   backBtn.addEventListener("click", hideViewer);
 
-  askBtn.addEventListener("click", function () {
+askBtn.addEventListener("click", function () {
     var path = askBtn.dataset.path;
     if (!path || !inputEl) return;
+    if (!attachedFiles.has(path)) {
+        attachedFiles.add(path);
+        window.attachedFiles = attachedFiles;
+    }
     inputEl.value = "Explain the file `" + path + "` and summarize what it does.";
     inputEl.focus();
-  });
+});
 
   document.addEventListener("DOMContentLoaded", loadTree);
 })();

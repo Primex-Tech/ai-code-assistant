@@ -55,7 +55,7 @@ from flask import (
 from flask_login import current_user, login_required
 
 from app.extensions import db
-from app.models import Project, ProjectMessage, User, Workspace, WorkspaceMember
+from app.models import Project, ProjectMessage, ProjectSession, User, Workspace, WorkspaceMember
 from app.models.activity_event import (
     EVENT_AI_ANALYSIS_RUN,
     EVENT_MEMBER_ADDED,
@@ -117,6 +117,12 @@ def _get_workspace(workspace_id: int) -> Workspace:
 
 def _get_project(project_id: int) -> Project:
     return Project.query.filter_by(id=project_id, user_id=current_user.id).first_or_404()
+
+
+def _get_project_session(project_id: int, session_id: int) -> ProjectSession:
+    project = _get_project(project_id)
+    session = ProjectSession.query.filter_by(id=session_id, project_id=project.id).first_or_404()
+    return session
 
 
 def _member_role(workspace_id: int) -> str | None:
@@ -843,9 +849,12 @@ def _is_test_path(path: str) -> bool:
 @login_required
 def api_project_messages(project_id: int):
     project = _get_project(project_id)
-    messages = ProjectMessage.query.filter_by(project_id=project.id).order_by(
-        ProjectMessage.created_at
-    )
+    session_id = request.args.get("session_id", type=int)
+    query = ProjectMessage.query.filter_by(project_id=project.id)
+    if session_id is not None:
+        session = _get_project_session(project_id, session_id)
+        query = query.filter_by(session_id=session.id)
+    messages = query.order_by(ProjectMessage.created_at).all()
     return jsonify([m.to_dict() for m in messages])
 
 
@@ -863,12 +872,32 @@ def api_project_chat(project_id: int):
         return jsonify({"error": "This project has not finished indexing."}), 409
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
+    session_id = data.get("session_id", type=int)
+    attached_files = data.get("attached_files") or []
     if not content:
         return jsonify({"error": "A message is required."}), 400
 
-    db.session.add(ProjectMessage(project_id=project.id, role="user", content=content))
-    result = project_analysis.chat_with_project(project, content)
-    message = ProjectMessage(project_id=project.id, role="assistant", content=result["analysis"])
+    if session_id is not None:
+        session = _get_project_session(project_id, session_id)
+    else:
+        session = ProjectSession.query.filter_by(project_id=project.id, is_default=True).first()
+        if session is None:
+            session = ProjectSession(
+                project_id=project.id,
+                user_id=current_user.id,
+                title="Default session",
+                is_default=True,
+            )
+            db.session.add(session)
+            db.session.commit()
+
+    db.session.add(
+        ProjectMessage(project_id=project.id, role="user", content=content, session_id=session.id)
+    )
+    result = project_analysis.chat_with_project(project, content, attached_files=attached_files)
+    message = ProjectMessage(
+        project_id=project.id, role="assistant", content=result["analysis"], session_id=session.id
+    )
     db.session.add(message)
     db.session.commit()
     return (
@@ -896,13 +925,33 @@ def api_project_chat_stream(project_id: int):
         return jsonify({"error": "This project has not finished indexing."}), 409
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
+    session_id = data.get("session_id", type=int)
+    attached_files = data.get("attached_files") or []
     if not content:
         return jsonify({"error": "A message is required."}), 400
 
+    if session_id is not None:
+        session = _get_project_session(project_id, session_id)
+    else:
+        session = ProjectSession.query.filter_by(project_id=project.id, is_default=True).first()
+        if session is None:
+            session = ProjectSession(
+                project_id=project.id,
+                user_id=current_user.id,
+                title="Default session",
+                is_default=True,
+            )
+            db.session.add(session)
+            db.session.commit()
+
     history = list(project.messages)
-    db.session.add(ProjectMessage(project_id=project.id, role="user", content=content))
+    db.session.add(
+        ProjectMessage(project_id=project.id, role="user", content=content, session_id=session.id)
+    )
     db.session.commit()
-    messages = project_analysis.build_messages(project, content, history)
+    messages = project_analysis.build_messages(
+        project, content, history, attached_files=attached_files
+    )
 
     def generate():
         try:
@@ -914,17 +963,74 @@ def api_project_chat_stream(project_id: int):
             return
 
         try:
-            reply = project_analysis.chat_with_project(project, content)["analysis"]
+            reply = project_analysis.chat_with_project(
+                project, content, attached_files=attached_files
+            )["analysis"]
         except LLMProviderError as exc:
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
             return
 
-        message = ProjectMessage(project_id=project.id, role="assistant", content=reply)
+        message = ProjectMessage(
+            project_id=project.id, role="assistant", content=reply, session_id=session.id
+        )
         db.session.add(message)
         db.session.commit()
         yield f"data: {json.dumps({'type': 'done', 'message': message.to_dict()})}\n\n"
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+
+# --------------------------------------------------------------------------
+# API: project sessions
+# --------------------------------------------------------------------------
+
+
+@bp.route("/api/projects/<int:project_id>/sessions", methods=["GET"])
+@login_required
+def api_project_sessions(project_id: int):
+    """List all sessions for a project."""
+    project = _get_project(project_id)
+    sessions = (
+        ProjectSession.query.filter_by(project_id=project.id)
+        .order_by(ProjectSession.updated_at.desc())
+        .all()
+    )
+    return jsonify([s.to_dict() for s in sessions])
+
+
+@bp.route("/api/projects/<int:project_id>/sessions", methods=["POST"])
+@login_required
+def api_create_project_session(project_id: int):
+    """Create a new session for a project."""
+    project = _get_project(project_id)
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "New session").strip()[:200]
+    session = ProjectSession(project_id=project.id, user_id=current_user.id, title=title)
+    db.session.add(session)
+    db.session.commit()
+    return jsonify(session.to_dict()), 201
+
+
+@bp.route("/api/projects/<int:project_id>/sessions/<int:session_id>", methods=["PATCH"])
+@login_required
+def api_update_project_session(project_id: int, session_id: int):
+    """Update a session's title."""
+    session = _get_project_session(project_id, session_id)
+    data = request.get_json(silent=True) or {}
+    if "title" in data:
+        session.title = (data.get("title") or "Untitled").strip()[:200]
+    db.session.commit()
+    return jsonify(session.to_dict())
+
+
+@bp.route("/api/projects/<int:project_id>/sessions/<int:session_id>", methods=["DELETE"])
+@login_required
+def api_delete_project_session(project_id: int, session_id: int):
+    """Delete a session and its messages."""
+    session = _get_project_session(project_id, session_id)
+    db.session.delete(session)
+    db.session.commit()
+    return jsonify({"ok": True})
 
 
 # --------------------------------------------------------------------------

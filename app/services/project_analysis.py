@@ -256,14 +256,16 @@ def _complete(messages: list[dict]) -> str:
         return f"[analysis unavailable: {exc}]"
 
 
-def build_messages(project, question: str, history: list) -> list[dict]:
+def build_messages(
+    project, question: str, history: list, attached_files: list[str] | None = None
+) -> list[dict]:
     """Build the provider message list for a project chat request.
 
     Includes bounded recent history, the project structure summary, and only
     the retrieved (bounded) file context for ``question``.
     """
     _assert_accessible(project)
-    context = build_context(project, question)
+    context = build_context(project, question, attached_files=attached_files)
     structure = project_structure(project)
     user_prompt = (
         f"{_context_header(project)}\n\n"
@@ -326,7 +328,9 @@ def project_structure(project) -> str:
     return summary + "\n" + "\n".join(files)
 
 
-def build_context(project, question: str, *, budget: int | None = None) -> dict:
+def build_context(
+    project, question: str, *, budget: int | None = None, attached_files: list[str] | None = None
+) -> dict:
     """Select the most relevant files for ``question`` within ``budget`` chars.
 
     Returns ``{"blocks", "paths"}`` where ``blocks`` is the assembled, clipped
@@ -341,17 +345,25 @@ def build_context(project, question: str, *, budget: int | None = None) -> dict:
     files = project.files.all()
     tokens = _keywords(question)
 
+    selected: list[ProjectFile] = []
+
+    # 0) Pin attached files before keyword scoring.
+    if attached_files:
+        attached_set = set(attached_files)
+        for file in files:
+            if file.path in attached_set and file.content is not None and file not in selected:
+                selected.append(file)
+
     # 1) Files whose path matches a question keyword.
     scored = []
     for file in files:
-        if file.content is None:
+        if file.content is None or file in selected:
             continue
         score = _path_score(file.path, tokens)
         if score > 0:
             scored.append((score, file))
     scored.sort(key=lambda item: (-item[0], item[1].size))
 
-    selected: list[ProjectFile] = []
     for _, file in scored:
         if len(selected) >= MAX_CONTEXT_FILES:
             break
@@ -583,11 +595,11 @@ def dependency_inventory(project) -> list[dict]:
 # --------------------------------------------------------------------------
 
 
-def chat_with_project(project, question: str) -> dict:
+def chat_with_project(project, question: str, attached_files: list[str] | None = None) -> dict:
     """Answer ``question`` about ``project`` using bounded retrieved context."""
     _assert_accessible(project)
-    context = build_context(project, question)
-    messages = build_messages(project, question, [])
+    context = build_context(project, question, attached_files=attached_files)
+    messages = build_messages(project, question, [], attached_files=attached_files)
     return {
         "context_paths": context["paths"],
         "analysis": _complete(messages),
