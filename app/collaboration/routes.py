@@ -867,6 +867,45 @@ def api_delete_comment(project_id: int, comment_id: int):
     return jsonify({"ok": True})
 
 
+@bp.route("/api/projects/<int:project_id>/share", methods=["POST"])
+@login_required
+def api_share_project(project_id: int):
+    """Share a project with another user, creating a share notification."""
+    project = resolve_project_collab(project_id)
+    data = request.get_json(silent=True) or {}
+    try:
+        target_id = int(data.get("user_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "A valid user_id is required."}), 400
+
+    if target_id == current_user.id:
+        return jsonify({"error": "You cannot share a project with yourself."}), 400
+
+    target = db.session.get(User, target_id)
+    if target is None:
+        return jsonify({"error": "User not found."}), 404
+
+    workspace = db.session.get(Workspace, project.workspace_id)
+    notify(
+        target,
+        "share",
+        actor=current_user,
+        workspace=workspace,
+        project=project,
+        payload={
+            "title": f"{current_user.username} shared {project.name} with you",
+            "project": project.name,
+        },
+        link=url_for(
+            "workspaces.project_explorer",
+            workspace_id=project.workspace_id,
+            project_id=project.id,
+        ),
+    )
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
 # --------------------------------------------------------------------------
 # API: inline review comments (#52)
 # --------------------------------------------------------------------------
